@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useEffect } from 'react';
+import { AuthProvider, useAuth } from './context/AuthContext';
 import { Navbar } from './components/Navbar';
 import { Footer } from './components/Footer';
 import { Hero } from './components/Hero';
@@ -16,6 +17,8 @@ import { LearningResourcesSection } from './components/LearningResourcesSection'
 import { DashboardSection } from './components/DashboardSection';
 import { GlobalSearchModal } from './components/GlobalSearchModal';
 import { RandomQuestionModal } from './components/RandomQuestionModal';
+import { GeminiChatModal } from './components/GeminiChatModal';
+import { LiveVoiceVivaModal } from './components/LiveVoiceVivaModal';
 
 import { problemStatements } from './data/problemStatements';
 import { questionsData } from './data/questions';
@@ -30,11 +33,13 @@ import {
   toggleCompletedProblem,
   toggleCompletedCaseStudy,
   saveNotes,
-  resetAllUserProgress
+  resetAllUserProgress,
+  saveUserProgress,
 } from './utils/storage';
 import { UserProgressState, QuestionCategory } from './types';
 
-export default function App() {
+function MainAppContent() {
+  const { user, idToken } = useAuth();
   const [activeSection, setActiveSection] = useState<string>('home');
   const [userProgress, setUserProgress] = useState<UserProgressState>(loadUserProgress());
   
@@ -45,31 +50,108 @@ export default function App() {
   // Modals state
   const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
   const [isRandomQuestionOpen, setIsRandomQuestionOpen] = useState<boolean>(false);
+  const [isGeminiChatOpen, setIsGeminiChatOpen] = useState<boolean>(false);
+  const [isLiveVoiceOpen, setIsLiveVoiceOpen] = useState<boolean>(false);
+
+  // Synchronize Cloud SQL progress when user logs in
+  useEffect(() => {
+    if (user && idToken) {
+      // Fetch progress from Cloud SQL
+      fetch('/api/progress', {
+        headers: { Authorization: `Bearer ${idToken}` },
+      })
+        .then((r) => r.json())
+        .then((data) => {
+          if (data.progress) {
+            setUserProgress((prev) => {
+              const merged: UserProgressState = {
+                bookmarkedQuestionIds: Array.from(
+                  new Set([...prev.bookmarkedQuestionIds, ...data.progress.bookmarkedQuestionIds])
+                ),
+                completedProblemIds: Array.from(
+                  new Set([...prev.completedProblemIds, ...data.progress.completedProblemIds])
+                ),
+                completedCaseStudyIds: Array.from(
+                  new Set([...prev.completedCaseStudyIds, ...data.progress.completedCaseStudyIds])
+                ),
+                testHistory: prev.testHistory,
+                notes: data.progress.notes || prev.notes,
+              };
+              saveUserProgress(merged);
+              return merged;
+            });
+          }
+        })
+        .catch((e) => console.warn('Could not sync progress from Cloud SQL:', e));
+
+      // Fetch test results from Cloud SQL
+      fetch('/api/test-results', {
+        headers: { Authorization: `Bearer ${idToken}` },
+      })
+        .then((r) => r.json())
+        .then((data) => {
+          if (data.results && data.results.length > 0) {
+            setUserProgress((prev) => {
+              const mergedHistory = [...data.results, ...prev.testHistory];
+              const uniqueHistory = Array.from(new Map(mergedHistory.map((m) => [m.id, m])).values());
+              const updated = { ...prev, testHistory: uniqueHistory };
+              saveUserProgress(updated);
+              return updated;
+            });
+          }
+        })
+        .catch((e) => console.warn('Could not sync test results from Cloud SQL:', e));
+    }
+  }, [user, idToken]);
+
+  // Push updates to Cloud SQL if user is authenticated
+  const pushProgressToDb = (updated: UserProgressState) => {
+    if (user && idToken) {
+      fetch('/api/progress', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          bookmarkedQuestionIds: updated.bookmarkedQuestionIds,
+          completedProblemIds: updated.completedProblemIds,
+          completedCaseStudyIds: updated.completedCaseStudyIds,
+          notes: updated.notes,
+        }),
+      }).catch((e) => console.warn('Cloud SQL progress push failed:', e));
+    }
+  };
 
   // Keep progress in sync
   const handleToggleBookmark = (id: string) => {
     const updated = toggleBookmarkQuestion(id);
     setUserProgress(updated);
+    pushProgressToDb(updated);
   };
 
   const handleToggleCompletedProblem = (id: string) => {
     const updated = toggleCompletedProblem(id);
     setUserProgress(updated);
+    pushProgressToDb(updated);
   };
 
   const handleToggleCompletedCase = (id: string) => {
     const updated = toggleCompletedCaseStudy(id);
     setUserProgress(updated);
+    pushProgressToDb(updated);
   };
 
   const handleSaveNotes = (notes: string) => {
     const updated = saveNotes(notes);
     setUserProgress(updated);
+    pushProgressToDb(updated);
   };
 
   const handleResetProgress = () => {
     const updated = resetAllUserProgress();
     setUserProgress(updated);
+    pushProgressToDb(updated);
   };
 
   // Quick navigation handlers
@@ -110,6 +192,8 @@ export default function App() {
         setActiveSection={setActiveSection}
         onOpenSearch={() => setIsSearchOpen(true)}
         onOpenRandomQuestion={() => setIsRandomQuestionOpen(true)}
+        onOpenGeminiChat={() => setIsGeminiChatOpen(true)}
+        onOpenLiveVoice={() => setIsLiveVoiceOpen(true)}
       />
 
       {/* Main Content Area */}
@@ -159,6 +243,18 @@ export default function App() {
             onSaveTestResult={(res) => {
               const updated = saveTestResult(res);
               setUserProgress(updated);
+
+              // Also persist to Cloud SQL if signed in
+              if (user && idToken) {
+                fetch('/api/test-results', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${idToken}`,
+                  },
+                  body: JSON.stringify(res),
+                }).catch((e) => console.warn('Could not save test to Cloud SQL:', e));
+              }
             }}
             presetCategory={mockExamPresetCategory}
           />
@@ -238,9 +334,30 @@ export default function App() {
         isBookmarked={(id) => userProgress.bookmarkedQuestionIds.includes(id)}
       />
 
+      {/* Gemini Chatbot Modal (Multi-Turn Chat, Search Grounding, Voice Input Transcription) */}
+      <GeminiChatModal
+        isOpen={isGeminiChatOpen}
+        onClose={() => setIsGeminiChatOpen(false)}
+        onOpenLiveVoice={() => setIsLiveVoiceOpen(true)}
+      />
+
+      {/* Gemini 3.8 Live API Real-Time Voice Viva Modal */}
+      <LiveVoiceVivaModal
+        isOpen={isLiveVoiceOpen}
+        onClose={() => setIsLiveVoiceOpen(false)}
+      />
+
       {/* Footer */}
       <Footer setActiveSection={setActiveSection} />
 
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <MainAppContent />
+    </AuthProvider>
   );
 }
